@@ -1,0 +1,35 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Active User Server Admin</title>
+  <link rel="stylesheet" href="/static/admin.css">
+</head>
+<body>
+  <div class="login-wrap">
+    <div class="card">
+      <h1>Server Admin</h1>
+      <p class="subtitle">LMS active user presence console</p>
+
+      {% if error %}
+      <p class="error">{{ error }}</p>
+      {% endif %}
+
+      {% if admin_configured %}
+      <form method="post" action="/admin/login">
+        <label for="username">Username</label>
+        <input id="username" name="username" type="text" autocomplete="username" required autofocus>
+
+        <label for="password">Password</label>
+        <input id="password" name="password" type="password" autocomplete="current-password" required>
+
+        <button class="btn btn-block" type="submit">Sign in</button>
+      </form>
+      {% else %}
+      <p class="error">Set <code>ADMIN_USERNAME</code> and <code>ADMIN_PASSWORD</code> on the server to enable login.</p>
+      {% endif %}
+    </div>
+  </div>
+</body>
+</html>

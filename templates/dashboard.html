@@ -1,0 +1,186 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Active Users — Admin</title>
+  <link rel="stylesheet" href="/static/admin.css">
+</head>
+<body>
+  <div class="shell">
+    <header class="topbar">
+      <div>
+        <h1>Active users</h1>
+        <p class="meta">Live presence on this Render server · refreshes every 8s</p>
+      </div>
+      <div class="topbar-actions">
+        <form method="post" action="/admin/logout">
+          <button class="btn btn-secondary" type="submit">Log out</button>
+        </form>
+      </div>
+    </header>
+
+    <section class="stats" id="stats">
+      <div class="stat">
+        <div class="label">Total active</div>
+        <div class="value" data-stat="total">{{ stats.total }}</div>
+      </div>
+      {% for role_name in roles %}
+      <div class="stat">
+        <div class="label">{{ role_name.replace('_', ' ') }}</div>
+        <div class="value" data-stat-role="{{ role_name }}">{{ stats.by_role.get(role_name, 0) }}</div>
+      </div>
+      {% endfor %}
+    </section>
+
+    <form class="filters" id="filters" method="get" action="/admin">
+      <div class="field">
+        <label for="q">Search</label>
+        <input id="q" name="q" type="text" value="{{ filters.q }}" placeholder="Name, user ID, or school">
+      </div>
+      <div class="field">
+        <label for="school_id">School</label>
+        <select id="school_id" name="school_id">
+          <option value="">All schools</option>
+          {% for school in stats.by_school %}
+          <option value="{{ school.school_id }}" {% if filters.school_id is not none and filters.school_id == school.school_id %}selected{% endif %}>
+            {{ school.school_name }} ({{ school.count }})
+          </option>
+          {% endfor %}
+        </select>
+      </div>
+      <div class="field">
+        <label for="role">Role</label>
+        <select id="role" name="role">
+          <option value="">All roles</option>
+          {% for role_name in roles %}
+          <option value="{{ role_name }}" {% if filters.role == role_name %}selected{% endif %}>{{ role_name.replace('_', ' ') }}</option>
+          {% endfor %}
+        </select>
+      </div>
+      <button class="btn" type="submit">Apply</button>
+    </form>
+
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>Name</th>
+            <th>User ID</th>
+            <th>Role</th>
+            <th>School</th>
+            <th>Last seen</th>
+          </tr>
+        </thead>
+        <tbody id="users-body">
+          {% if users %}
+            {% for user in users %}
+            <tr>
+              <td>{{ user.name or '—' }}</td>
+              <td>{{ user.user_id }}</td>
+              <td><span class="role-pill">{{ user.role }}</span></td>
+              <td>{{ user.school_name }}</td>
+              <td data-seconds="{{ user.seconds_ago }}">{{ user.seconds_ago }}s ago</td>
+            </tr>
+            {% endfor %}
+          {% else %}
+            <tr class="empty-row"><td colspan="5" class="empty">No active users match these filters.</td></tr>
+          {% endif %}
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+  <script>
+    const roles = {{ roles | tojson }};
+    const filtersForm = document.getElementById("filters");
+    const usersBody = document.getElementById("users-body");
+
+    function currentParams() {
+      const data = new FormData(filtersForm);
+      const params = new URLSearchParams();
+      for (const [key, value] of data.entries()) {
+        if (String(value).trim() !== "") {
+          params.set(key, String(value).trim());
+        }
+      }
+      return params;
+    }
+
+    function formatAgo(seconds) {
+      const s = Number(seconds) || 0;
+      if (s < 60) return s + "s ago";
+      const m = Math.floor(s / 60);
+      if (m < 60) return m + "m ago";
+      const h = Math.floor(m / 60);
+      return h + "h ago";
+    }
+
+    function renderUsers(users) {
+      if (!users.length) {
+        usersBody.innerHTML = '<tr class="empty-row"><td colspan="5" class="empty">No active users match these filters.</td></tr>';
+        return;
+      }
+      usersBody.innerHTML = users.map((user) => `
+        <tr>
+          <td>${escapeHtml(user.name || "—")}</td>
+          <td>${user.user_id}</td>
+          <td><span class="role-pill">${escapeHtml(user.role)}</span></td>
+          <td>${escapeHtml(user.school_name)}</td>
+          <td>${formatAgo(user.seconds_ago)}</td>
+        </tr>
+      `).join("");
+    }
+
+    function renderStats(stats) {
+      const totalEl = document.querySelector('[data-stat="total"]');
+      if (totalEl) totalEl.textContent = stats.total;
+      for (const role of roles) {
+        const el = document.querySelector(`[data-stat-role="${role}"]`);
+        if (el) el.textContent = (stats.by_role && stats.by_role[role]) || 0;
+      }
+
+      const schoolSelect = document.getElementById("school_id");
+      const selected = schoolSelect.value;
+      const options = ['<option value="">All schools</option>'].concat(
+        (stats.by_school || []).map((school) =>
+          `<option value="${school.school_id}">${escapeHtml(school.school_name)} (${school.count})</option>`
+        )
+      );
+      schoolSelect.innerHTML = options.join("");
+      if ([...schoolSelect.options].some((opt) => opt.value === selected)) {
+        schoolSelect.value = selected;
+      }
+    }
+
+    function escapeHtml(value) {
+      return String(value)
+        .replaceAll("&", "&amp;")
+        .replaceAll("<", "&lt;")
+        .replaceAll(">", "&gt;")
+        .replaceAll('"', "&quot;");
+    }
+
+    async function refresh() {
+      try {
+        const res = await fetch("/admin/api/users?" + currentParams().toString(), {
+          headers: { Accept: "application/json" },
+          credentials: "same-origin",
+        });
+        if (res.status === 401) {
+          window.location.href = "/admin/login";
+          return;
+        }
+        if (!res.ok) return;
+        const data = await res.json();
+        renderUsers(data.users || []);
+        renderStats(data.stats || { total: 0, by_role: {}, by_school: [] });
+      } catch (_) {
+        // Keep last snapshot on transient errors.
+      }
+    }
+
+    setInterval(refresh, 8000);
+  </script>
+</body>
+</html>
