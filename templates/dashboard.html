@@ -11,7 +11,7 @@
     <header class="topbar">
       <div>
         <h1>Active users</h1>
-        <p class="meta">Live presence on this Render server · refreshes every 8s</p>
+        <p class="meta">Live presence on this Render server · refreshes every 3s</p>
       </div>
       <div class="topbar-actions">
         <form method="post" action="/admin/logout">
@@ -180,7 +180,7 @@
       }
     }
 
-    setInterval(refresh, 8000);
+    setInterval(refresh, 3000);
   </script>
 </body>
 </html>

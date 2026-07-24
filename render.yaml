@@ -9,7 +9,9 @@ services:
       - key: ACTIVE_USER_SECRET
         sync: false
       - key: ACTIVE_USER_TTL_SECONDS
-        value: "300"
+        value: "9"
+      - key: ACTIVE_USER_EXPIRY_INTERVAL_SECONDS
+        value: "3"
       - key: ALLOWED_ORIGINS
         sync: false
       - key: ADMIN_USERNAME

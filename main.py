@@ -25,7 +25,8 @@ load_dotenv()
 BASE_DIR = Path(__file__).resolve().parent
 
 ACTIVE_USER_SECRET = os.getenv("ACTIVE_USER_SECRET", "")
-ACTIVE_USER_TTL_SECONDS = int(os.getenv("ACTIVE_USER_TTL_SECONDS", "300"))
+ACTIVE_USER_TTL_SECONDS = int(os.getenv("ACTIVE_USER_TTL_SECONDS", "9"))
+ACTIVE_USER_EXPIRY_INTERVAL_SECONDS = int(os.getenv("ACTIVE_USER_EXPIRY_INTERVAL_SECONDS", "3"))
 ALLOWED_ORIGINS = [
     origin.strip()
     for origin in os.getenv("ALLOWED_ORIGINS", "*").split(",")
@@ -86,6 +87,16 @@ class PresenceStore:
                 school_name=school_name,
             )
         await self.notify_watchers({user_id})
+
+    async def leave(self, user_id: int) -> bool:
+        removed = False
+        async with self._lock:
+            if user_id in self.users:
+                del self.users[user_id]
+                removed = True
+        if removed:
+            await self.notify_watchers({user_id})
+        return removed
 
     async def expire_stale(self) -> None:
         now = time.time()
@@ -198,8 +209,9 @@ store = PresenceStore(ACTIVE_USER_TTL_SECONDS)
 
 
 async def expiry_loop() -> None:
+    interval = max(1, ACTIVE_USER_EXPIRY_INTERVAL_SECONDS)
     while True:
-        await asyncio.sleep(30)
+        await asyncio.sleep(interval)
         await store.expire_stale()
 
 
@@ -241,6 +253,10 @@ class HeartbeatPayload(BaseModel):
     role: str = Field(min_length=1, max_length=32)
     name: str = Field(default="", max_length=255)
     school_name: str = Field(default="", max_length=255)
+
+
+class LeavePayload(BaseModel):
+    user_id: int = Field(gt=0)
 
 
 def require_server_key(header: str | None) -> None:
@@ -333,6 +349,16 @@ async def heartbeat(
         school_name=payload.school_name,
     )
     return {"ok": True}
+
+
+@app.post("/leave")
+async def leave(
+    payload: LeavePayload,
+    x_active_user_key: str | None = Header(default=None, alias="X-Active-User-Key"),
+) -> dict[str, bool]:
+    require_server_key(x_active_user_key)
+    removed = await store.leave(payload.user_id)
+    return {"ok": True, "removed": removed}
 
 
 @app.get("/active")
