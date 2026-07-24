@@ -8,14 +8,21 @@ import os
 import time
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, Header, HTTPException, Query, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, Form, Header, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi.staticfiles import StaticFiles
+from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel, Field
+from starlette.middleware.sessions import SessionMiddleware
 
 load_dotenv()
+
+BASE_DIR = Path(__file__).resolve().parent
 
 ACTIVE_USER_SECRET = os.getenv("ACTIVE_USER_SECRET", "")
 ACTIVE_USER_TTL_SECONDS = int(os.getenv("ACTIVE_USER_TTL_SECONDS", "300"))
@@ -24,6 +31,9 @@ ALLOWED_ORIGINS = [
     for origin in os.getenv("ALLOWED_ORIGINS", "*").split(",")
     if origin.strip()
 ]
+ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "")
+ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "")
+ADMIN_SESSION_SECRET = os.getenv("ADMIN_SESSION_SECRET") or ACTIVE_USER_SECRET or "change-me-admin-session"
 
 
 @dataclass
@@ -33,6 +43,7 @@ class UserPresence:
     role: str
     name: str
     last_seen: float
+    school_name: str = ""
 
 
 @dataclass
@@ -57,7 +68,14 @@ class PresenceStore:
     def active_from(self, user_ids: list[int]) -> list[int]:
         return [user_id for user_id in user_ids if self.is_active(user_id)]
 
-    async def heartbeat(self, user_id: int, school_id: int, role: str, name: str) -> None:
+    async def heartbeat(
+        self,
+        user_id: int,
+        school_id: int,
+        role: str,
+        name: str,
+        school_name: str = "",
+    ) -> None:
         async with self._lock:
             self.users[user_id] = UserPresence(
                 user_id=user_id,
@@ -65,6 +83,7 @@ class PresenceStore:
                 role=role,
                 name=name,
                 last_seen=time.time(),
+                school_name=school_name,
             )
         await self.notify_watchers({user_id})
 
@@ -112,6 +131,68 @@ class PresenceStore:
             except Exception:
                 await self.remove_subscription(subscription)
 
+    def _active_entries(self) -> list[UserPresence]:
+        now = time.time()
+        return [
+            entry
+            for entry in self.users.values()
+            if (now - entry.last_seen) <= self.ttl_seconds
+        ]
+
+    def list_active(
+        self,
+        school_id: int | None = None,
+        role: str | None = None,
+        q: str | None = None,
+    ) -> list[UserPresence]:
+        query = (q or "").strip().lower()
+        role_filter = (role or "").strip().lower()
+        results: list[UserPresence] = []
+
+        for entry in self._active_entries():
+            if school_id is not None and entry.school_id != school_id:
+                continue
+            if role_filter and entry.role.lower() != role_filter:
+                continue
+            if query:
+                name_match = query in entry.name.lower()
+                id_match = query.isdigit() and int(query) == entry.user_id
+                school_match = query in entry.school_name.lower()
+                if not (name_match or id_match or school_match):
+                    continue
+            results.append(entry)
+
+        results.sort(key=lambda item: (-item.last_seen, item.name.lower(), item.user_id))
+        return results
+
+    def stats(self) -> dict[str, Any]:
+        entries = self._active_entries()
+        by_role: dict[str, int] = {}
+        by_school: dict[str, dict[str, Any]] = {}
+
+        for entry in entries:
+            by_role[entry.role] = by_role.get(entry.role, 0) + 1
+            school_key = str(entry.school_id)
+            if school_key not in by_school:
+                by_school[school_key] = {
+                    "school_id": entry.school_id,
+                    "school_name": entry.school_name or ("Platform" if entry.school_id == 0 else f"School #{entry.school_id}"),
+                    "count": 0,
+                }
+            by_school[school_key]["count"] += 1
+            if entry.school_name and not by_school[school_key]["school_name"]:
+                by_school[school_key]["school_name"] = entry.school_name
+
+        schools = sorted(
+            by_school.values(),
+            key=lambda item: (-int(item["count"]), str(item["school_name"]).lower()),
+        )
+        return {
+            "total": len(entries),
+            "by_role": dict(sorted(by_role.items(), key=lambda item: item[0])),
+            "by_school": schools,
+        }
+
 
 store = PresenceStore(ACTIVE_USER_TTL_SECONDS)
 
@@ -140,6 +221,18 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+app.add_middleware(
+    SessionMiddleware,
+    secret_key=ADMIN_SESSION_SECRET,
+    session_cookie="active_user_admin",
+    same_site="lax",
+    https_only=False,
+)
+
+templates = Jinja2Templates(directory=str(BASE_DIR / "templates"))
+static_dir = BASE_DIR / "static"
+static_dir.mkdir(exist_ok=True)
+app.mount("/static", StaticFiles(directory=str(static_dir)), name="static")
 
 
 class HeartbeatPayload(BaseModel):
@@ -147,6 +240,7 @@ class HeartbeatPayload(BaseModel):
     school_id: int = Field(ge=0)
     role: str = Field(min_length=1, max_length=32)
     name: str = Field(default="", max_length=255)
+    school_name: str = Field(default="", max_length=255)
 
 
 def require_server_key(header: str | None) -> None:
@@ -154,6 +248,10 @@ def require_server_key(header: str | None) -> None:
         raise HTTPException(status_code=503, detail="Server secret not configured.")
     if not header or not hmac.compare_digest(header, ACTIVE_USER_SECRET):
         raise HTTPException(status_code=401, detail="Invalid server key.")
+
+
+def admin_configured() -> bool:
+    return bool(ADMIN_USERNAME and ADMIN_PASSWORD)
 
 
 def verify_ws_token(token: str) -> dict[str, Any]:
@@ -190,9 +288,35 @@ def verify_ws_token(token: str) -> dict[str, Any]:
     return payload
 
 
+def presence_to_dict(entry: UserPresence) -> dict[str, Any]:
+    now = time.time()
+    return {
+        "user_id": entry.user_id,
+        "name": entry.name,
+        "role": entry.role,
+        "school_id": entry.school_id,
+        "school_name": entry.school_name
+        or ("Platform" if entry.school_id == 0 else f"School #{entry.school_id}"),
+        "last_seen": entry.last_seen,
+        "seconds_ago": max(0, int(now - entry.last_seen)),
+    }
+
+
+def require_admin_session(request: Request) -> None:
+    if not admin_configured():
+        raise HTTPException(status_code=503, detail="Admin login is not configured.")
+    if request.session.get("admin_authenticated") is not True:
+        raise HTTPException(status_code=401, detail="Admin login required.")
+
+
 @app.get("/health")
 async def health() -> dict[str, str]:
     return {"status": "ok"}
+
+
+@app.get("/")
+async def root() -> RedirectResponse:
+    return RedirectResponse(url="/admin", status_code=302)
 
 
 @app.post("/heartbeat")
@@ -206,6 +330,7 @@ async def heartbeat(
         school_id=payload.school_id,
         role=payload.role,
         name=payload.name,
+        school_name=payload.school_name,
     )
     return {"ok": True}
 
@@ -243,3 +368,118 @@ async def roster_ws(websocket: WebSocket, token: str = Query(default="")) -> Non
         pass
     finally:
         await store.remove_subscription(subscription)
+
+
+@app.get("/admin/login", response_class=HTMLResponse, response_model=None)
+async def admin_login_page(request: Request):
+    if request.session.get("admin_authenticated") is True and admin_configured():
+        return RedirectResponse(url="/admin", status_code=302)
+    return templates.TemplateResponse(
+        request,
+        "login.html",
+        {
+            "error": None,
+            "admin_configured": admin_configured(),
+        },
+    )
+
+
+@app.post("/admin/login", response_model=None)
+async def admin_login_submit(
+    request: Request,
+    username: str = Form(...),
+    password: str = Form(...),
+):
+    if not admin_configured():
+        return templates.TemplateResponse(
+            request,
+            "login.html",
+            {
+                "error": "Admin login is not configured. Set ADMIN_USERNAME and ADMIN_PASSWORD.",
+                "admin_configured": False,
+            },
+            status_code=503,
+        )
+
+    user_ok = hmac.compare_digest(username, ADMIN_USERNAME)
+    pass_ok = hmac.compare_digest(password, ADMIN_PASSWORD)
+    if not (user_ok and pass_ok):
+        return templates.TemplateResponse(
+            request,
+            "login.html",
+            {
+                "error": "Invalid username or password.",
+                "admin_configured": True,
+            },
+            status_code=401,
+        )
+
+    request.session["admin_authenticated"] = True
+    return RedirectResponse(url="/admin", status_code=303)
+
+
+@app.post("/admin/logout")
+async def admin_logout(request: Request) -> RedirectResponse:
+    request.session.clear()
+    return RedirectResponse(url="/admin/login", status_code=303)
+
+
+@app.get("/admin", response_class=HTMLResponse, response_model=None)
+async def admin_dashboard(
+    request: Request,
+    school_id: int | None = Query(default=None),
+    role: str = Query(default=""),
+    q: str = Query(default=""),
+) -> HTMLResponse:
+    if not admin_configured():
+        return templates.TemplateResponse(
+            request,
+            "login.html",
+            {
+                "error": "Admin login is not configured. Set ADMIN_USERNAME and ADMIN_PASSWORD.",
+                "admin_configured": False,
+            },
+            status_code=503,
+        )
+    if request.session.get("admin_authenticated") is not True:
+        return RedirectResponse(url="/admin/login", status_code=303)
+
+    role_filter = role.strip() or None
+    users = [presence_to_dict(entry) for entry in store.list_active(school_id, role_filter, q)]
+    stats = store.stats()
+
+    return templates.TemplateResponse(
+        request,
+        "dashboard.html",
+        {
+            "users": users,
+            "stats": stats,
+            "filters": {
+                "school_id": school_id,
+                "role": role.strip(),
+                "q": q.strip(),
+            },
+            "roles": ["student", "teacher", "school_admin", "super_admin"],
+        },
+    )
+
+
+@app.get("/admin/api/users")
+async def admin_api_users(
+    request: Request,
+    school_id: int | None = Query(default=None),
+    role: str = Query(default=""),
+    q: str = Query(default=""),
+) -> dict[str, Any]:
+    require_admin_session(request)
+    role_filter = role.strip() or None
+    users = [presence_to_dict(entry) for entry in store.list_active(school_id, role_filter, q)]
+    return {
+        "users": users,
+        "stats": store.stats(),
+        "filters": {
+            "school_id": school_id,
+            "role": role.strip(),
+            "q": q.strip(),
+        },
+    }

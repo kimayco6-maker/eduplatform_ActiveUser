@@ -1,15 +1,21 @@
 # LMS Active User Server
 
-Real-time student presence service for the teacher class roster. Deploy this folder to [Render](https://render.com) as a Python web service.
+Real-time student presence service for the teacher class roster, plus a password-protected admin console for platform operators. Deploy this folder to [Render](https://render.com) as a Python web service.
 
 ## Endpoints
 
 | Method | Path | Description |
 |--------|------|-------------|
 | `GET` | `/health` | Liveness check |
+| `GET` | `/` | Redirects to `/admin` |
 | `POST` | `/heartbeat` | LMS server heartbeat (`X-Active-User-Key` header) |
 | `GET` | `/active?user_ids=1,2,3` | Snapshot of active user IDs |
 | `WS` | `/ws/roster?token=...` | Teacher roster live updates |
+| `GET` | `/admin/login` | Server admin login page |
+| `POST` | `/admin/login` | Submit admin credentials |
+| `POST` | `/admin/logout` | End admin session |
+| `GET` | `/admin` | Active users dashboard (session required) |
+| `GET` | `/admin/api/users` | JSON list/filter/search for the dashboard |
 
 ## Environment variables
 
@@ -18,6 +24,11 @@ Real-time student presence service for the teacher class roster. Deploy this fol
 | `ACTIVE_USER_SECRET` | Shared secret with the LMS (`ACTIVE_USER_SERVER_SECRET`) |
 | `ACTIVE_USER_TTL_SECONDS` | Seconds before a user is considered offline (default `300`) |
 | `ALLOWED_ORIGINS` | Comma-separated LMS origins for browser WebSocket CORS |
+| `ADMIN_USERNAME` | Username for the `/admin` console |
+| `ADMIN_PASSWORD` | Password for the `/admin` console |
+| `ADMIN_SESSION_SECRET` | Cookie signing key (defaults to `ACTIVE_USER_SECRET`) |
+
+If `ADMIN_USERNAME` or `ADMIN_PASSWORD` is missing, the admin console returns a configuration error.
 
 ## Local development
 
@@ -30,13 +41,18 @@ copy .env.example .env
 uvicorn main:app --reload --port 8080
 ```
 
+Open `http://localhost:8080/admin/login` after setting admin credentials in `.env`.
+
 ## Render deployment
 
 1. Create a new **Web Service** on Render and point it at this folder.
 2. Set `ACTIVE_USER_SECRET` to the same value as `ACTIVE_USER_SERVER_SECRET` in the LMS `.env`.
 3. Set `ALLOWED_ORIGINS` to your LMS site URL(s).
-4. Copy the Render service URL into the LMS `.env` as `ACTIVE_USER_SERVER_URL` (no trailing slash).
-5. Run LMS migration `065_user_last_login_seen.sql`.
+4. Set `ADMIN_USERNAME` and `ADMIN_PASSWORD` for the ops console.
+5. Copy the Render service URL into the LMS `.env` as `ACTIVE_USER_SERVER_URL` (no trailing slash).
+6. Run LMS migration `065_user_last_login_seen.sql`.
+
+Visit `https://your-service.onrender.com/admin/login` to browse active users by school, role, and search.
 
 ## LMS `.env` example
 
