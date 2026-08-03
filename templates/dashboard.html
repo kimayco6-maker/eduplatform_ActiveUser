@@ -39,12 +39,12 @@
         <input id="q" name="q" type="text" value="{{ filters.q }}" placeholder="Name, user ID, or school">
       </div>
       <div class="field">
-        <label for="school_id">School</label>
-        <select id="school_id" name="school_id">
+        <label for="school_code">School</label>
+        <select id="school_code" name="school_code">
           <option value="">All schools</option>
           {% for school in stats.by_school %}
-          <option value="{{ school.school_id }}" {% if filters.school_id is not none and filters.school_id == school.school_id %}selected{% endif %}>
-            {{ school.school_name }} ({{ school.count }})
+          <option value="{{ school.school_code }}" {% if filters.school_code == school.school_code %}selected{% endif %}>
+            {{ school.school_name }} [{{ school.school_code }}] ({{ school.count }})
           </option>
           {% endfor %}
         </select>
@@ -79,7 +79,7 @@
               <td>{{ user.name or '—' }}</td>
               <td>{{ user.user_id }}</td>
               <td><span class="role-pill">{{ user.role }}</span></td>
-              <td>{{ user.school_name }}</td>
+              <td>{{ user.school_name }}{% if user.school_code %} <small style="opacity:.6">[{{ user.school_code }}]</small>{% endif %}</td>
               <td data-seconds="{{ user.seconds_ago }}">{{ user.seconds_ago }}s ago</td>
             </tr>
             {% endfor %}
@@ -126,7 +126,7 @@
           <td>${escapeHtml(user.name || "—")}</td>
           <td>${user.user_id}</td>
           <td><span class="role-pill">${escapeHtml(user.role)}</span></td>
-          <td>${escapeHtml(user.school_name)}</td>
+          <td>${escapeHtml(user.school_name)}${user.school_code ? ' <small style="opacity:.6">['+escapeHtml(user.school_code)+']</small>' : ''}</td>
           <td>${formatAgo(user.seconds_ago)}</td>
         </tr>
       `).join("");
@@ -140,11 +140,11 @@
         if (el) el.textContent = (stats.by_role && stats.by_role[role]) || 0;
       }
 
-      const schoolSelect = document.getElementById("school_id");
+      const schoolSelect = document.getElementById("school_code");
       const selected = schoolSelect.value;
       const options = ['<option value="">All schools</option>'].concat(
         (stats.by_school || []).map((school) =>
-          `<option value="${school.school_id}">${escapeHtml(school.school_name)} (${school.count})</option>`
+          `<option value="${escapeHtml(school.school_code)}">${escapeHtml(school.school_name)} [${escapeHtml(school.school_code)}] (${school.count})</option>`
         )
       );
       schoolSelect.innerHTML = options.join("");

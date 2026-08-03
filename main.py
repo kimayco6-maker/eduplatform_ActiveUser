@@ -41,6 +41,7 @@ ADMIN_SESSION_SECRET = os.getenv("ADMIN_SESSION_SECRET") or ACTIVE_USER_SECRET o
 class UserPresence:
     user_id: int
     school_id: int
+    school_code: str
     role: str
     name: str
     last_seen: float
@@ -50,72 +51,94 @@ class UserPresence:
 @dataclass
 class RosterSubscription:
     websocket: WebSocket
+    school_code: str
     student_ids: set[int] = field(default_factory=set)
 
 
 class PresenceStore:
+    """
+    Presence store keyed by composite "{school_code}:{user_id}".
+    This prevents cross-school user ID collisions when each school has its
+    own database where user IDs restart from 1.
+    """
+
     def __init__(self, ttl_seconds: int) -> None:
         self.ttl_seconds = ttl_seconds
-        self.users: dict[int, UserPresence] = {}
+        # key: "{school_code}:{user_id}"
+        self.users: dict[str, UserPresence] = {}
         self.subscriptions: list[RosterSubscription] = []
         self._lock = asyncio.Lock()
 
-    def is_active(self, user_id: int) -> bool:
-        entry = self.users.get(user_id)
+    @staticmethod
+    def _key(school_code: str, user_id: int) -> str:
+        return f"{school_code.upper()}:{user_id}"
+
+    def is_active(self, school_code: str, user_id: int) -> bool:
+        entry = self.users.get(self._key(school_code, user_id))
         if entry is None:
             return False
         return (time.time() - entry.last_seen) <= self.ttl_seconds
 
-    def active_from(self, user_ids: list[int]) -> list[int]:
-        return [user_id for user_id in user_ids if self.is_active(user_id)]
+    def active_from(self, school_code: str, user_ids: list[int]) -> list[int]:
+        return [uid for uid in user_ids if self.is_active(school_code, uid)]
 
     async def heartbeat(
         self,
         user_id: int,
         school_id: int,
+        school_code: str,
         role: str,
         name: str,
         school_name: str = "",
     ) -> None:
+        key = self._key(school_code, user_id)
         async with self._lock:
-            self.users[user_id] = UserPresence(
+            self.users[key] = UserPresence(
                 user_id=user_id,
                 school_id=school_id,
+                school_code=school_code.upper(),
                 role=role,
                 name=name,
                 last_seen=time.time(),
                 school_name=school_name,
             )
-        await self.notify_watchers({user_id})
+        await self.notify_watchers(school_code, {user_id})
 
-    async def leave(self, user_id: int) -> bool:
+    async def leave(self, school_code: str, user_id: int) -> bool:
+        key = self._key(school_code, user_id)
         removed = False
         async with self._lock:
-            if user_id in self.users:
-                del self.users[user_id]
+            if key in self.users:
+                del self.users[key]
                 removed = True
         if removed:
-            await self.notify_watchers({user_id})
+            await self.notify_watchers(school_code, {user_id})
         return removed
 
     async def expire_stale(self) -> None:
         now = time.time()
-        expired_ids: set[int] = set()
+        expired: dict[str, set[int]] = {}
         async with self._lock:
             stale = [
-                user_id
-                for user_id, entry in self.users.items()
+                (key, entry)
+                for key, entry in self.users.items()
                 if (now - entry.last_seen) > self.ttl_seconds
             ]
-            for user_id in stale:
-                expired_ids.add(user_id)
-                del self.users[user_id]
+            for key, entry in stale:
+                expired.setdefault(entry.school_code, set()).add(entry.user_id)
+                del self.users[key]
 
-        if expired_ids:
-            await self.notify_watchers(expired_ids)
+        for sc, ids in expired.items():
+            await self.notify_watchers(sc, ids)
 
-    async def add_subscription(self, websocket: WebSocket, student_ids: list[int]) -> RosterSubscription:
-        subscription = RosterSubscription(websocket=websocket, student_ids=set(student_ids))
+    async def add_subscription(
+        self, websocket: WebSocket, school_code: str, student_ids: list[int]
+    ) -> RosterSubscription:
+        subscription = RosterSubscription(
+            websocket=websocket,
+            school_code=school_code.upper(),
+            student_ids=set(student_ids),
+        )
         async with self._lock:
             self.subscriptions.append(subscription)
         return subscription
@@ -125,16 +148,17 @@ class PresenceStore:
             if subscription in self.subscriptions:
                 self.subscriptions.remove(subscription)
 
-    async def notify_watchers(self, changed_user_ids: set[int]) -> None:
+    async def notify_watchers(self, school_code: str, changed_user_ids: set[int]) -> None:
+        sc = school_code.upper()
         async with self._lock:
             targets = [
                 sub
                 for sub in self.subscriptions
-                if changed_user_ids.intersection(sub.student_ids)
+                if sub.school_code == sc and changed_user_ids.intersection(sub.student_ids)
             ]
 
         for subscription in targets:
-            active_ids = self.active_from(sorted(subscription.student_ids))
+            active_ids = self.active_from(sc, sorted(subscription.student_ids))
             try:
                 await subscription.websocket.send_json(
                     {"type": "presence", "active_user_ids": active_ids}
@@ -153,15 +177,19 @@ class PresenceStore:
     def list_active(
         self,
         school_id: int | None = None,
+        school_code: str | None = None,
         role: str | None = None,
         q: str | None = None,
     ) -> list[UserPresence]:
         query = (q or "").strip().lower()
         role_filter = (role or "").strip().lower()
+        sc_filter = (school_code or "").strip().upper()
         results: list[UserPresence] = []
 
         for entry in self._active_entries():
             if school_id is not None and entry.school_id != school_id:
+                continue
+            if sc_filter and entry.school_code != sc_filter:
                 continue
             if role_filter and entry.role.lower() != role_filter:
                 continue
@@ -183,11 +211,14 @@ class PresenceStore:
 
         for entry in entries:
             by_role[entry.role] = by_role.get(entry.role, 0) + 1
-            school_key = str(entry.school_id)
+            school_key = entry.school_code or str(entry.school_id)
             if school_key not in by_school:
                 by_school[school_key] = {
                     "school_id": entry.school_id,
-                    "school_name": entry.school_name or ("Platform" if entry.school_id == 0 else f"School #{entry.school_id}"),
+                    "school_code": entry.school_code,
+                    "school_name": entry.school_name or (
+                        "Platform" if entry.school_id == 0 else f"School #{entry.school_id}"
+                    ),
                     "count": 0,
                 }
             by_school[school_key]["count"] += 1
@@ -250,6 +281,7 @@ app.mount("/static", StaticFiles(directory=str(static_dir)), name="static")
 class HeartbeatPayload(BaseModel):
     user_id: int = Field(gt=0)
     school_id: int = Field(ge=0)
+    school_code: str = Field(default="", max_length=20)
     role: str = Field(min_length=1, max_length=32)
     name: str = Field(default="", max_length=255)
     school_name: str = Field(default="", max_length=255)
@@ -257,6 +289,7 @@ class HeartbeatPayload(BaseModel):
 
 class LeavePayload(BaseModel):
     user_id: int = Field(gt=0)
+    school_code: str = Field(default="", max_length=20)
 
 
 def require_server_key(header: str | None) -> None:
@@ -311,6 +344,7 @@ def presence_to_dict(entry: UserPresence) -> dict[str, Any]:
         "name": entry.name,
         "role": entry.role,
         "school_id": entry.school_id,
+        "school_code": entry.school_code,
         "school_name": entry.school_name
         or ("Platform" if entry.school_id == 0 else f"School #{entry.school_id}"),
         "last_seen": entry.last_seen,
@@ -344,6 +378,7 @@ async def heartbeat(
     await store.heartbeat(
         user_id=payload.user_id,
         school_id=payload.school_id,
+        school_code=payload.school_code,
         role=payload.role,
         name=payload.name,
         school_name=payload.school_name,
@@ -357,33 +392,35 @@ async def leave(
     x_active_user_key: str | None = Header(default=None, alias="X-Active-User-Key"),
 ) -> dict[str, bool]:
     require_server_key(x_active_user_key)
-    removed = await store.leave(payload.user_id)
+    removed = await store.leave(payload.school_code, payload.user_id)
     return {"ok": True, "removed": removed}
 
 
 @app.get("/active")
 async def active_users(
     user_ids: str = Query(default=""),
+    school_code: str = Query(default=""),
     x_active_user_key: str | None = Header(default=None, alias="X-Active-User-Key"),
 ) -> dict[str, list[int]]:
     require_server_key(x_active_user_key)
 
     ids = [int(part) for part in user_ids.split(",") if part.strip().isdigit()]
-    return {"active": store.active_from(ids)}
+    return {"active": store.active_from(school_code, ids)}
 
 
 @app.websocket("/ws/roster")
 async def roster_ws(websocket: WebSocket, token: str = Query(default="")) -> None:
     payload = verify_ws_token(token)
+    school_code = str(payload.get("school_code", ""))
     student_ids = [int(value) for value in payload.get("student_ids", []) if str(value).isdigit()]
 
     await websocket.accept()
-    subscription = await store.add_subscription(websocket, student_ids)
+    subscription = await store.add_subscription(websocket, school_code, student_ids)
 
     await websocket.send_json(
         {
             "type": "presence",
-            "active_user_ids": store.active_from(student_ids),
+            "active_user_ids": store.active_from(school_code, student_ids),
         }
     )
 
@@ -454,6 +491,7 @@ async def admin_logout(request: Request) -> RedirectResponse:
 async def admin_dashboard(
     request: Request,
     school_id: int | None = Query(default=None),
+    school_code: str = Query(default=""),
     role: str = Query(default=""),
     q: str = Query(default=""),
 ) -> HTMLResponse:
@@ -471,7 +509,11 @@ async def admin_dashboard(
         return RedirectResponse(url="/admin/login", status_code=303)
 
     role_filter = role.strip() or None
-    users = [presence_to_dict(entry) for entry in store.list_active(school_id, role_filter, q)]
+    sc_filter = school_code.strip() or None
+    users = [
+        presence_to_dict(entry)
+        for entry in store.list_active(school_id, sc_filter, role_filter, q)
+    ]
     stats = store.stats()
 
     return templates.TemplateResponse(
@@ -482,6 +524,7 @@ async def admin_dashboard(
             "stats": stats,
             "filters": {
                 "school_id": school_id,
+                "school_code": school_code.strip(),
                 "role": role.strip(),
                 "q": q.strip(),
             },
@@ -494,17 +537,23 @@ async def admin_dashboard(
 async def admin_api_users(
     request: Request,
     school_id: int | None = Query(default=None),
+    school_code: str = Query(default=""),
     role: str = Query(default=""),
     q: str = Query(default=""),
 ) -> dict[str, Any]:
     require_admin_session(request)
     role_filter = role.strip() or None
-    users = [presence_to_dict(entry) for entry in store.list_active(school_id, role_filter, q)]
+    sc_filter = school_code.strip() or None
+    users = [
+        presence_to_dict(entry)
+        for entry in store.list_active(school_id, sc_filter, role_filter, q)
+    ]
     return {
         "users": users,
         "stats": store.stats(),
         "filters": {
             "school_id": school_id,
+            "school_code": school_code.strip(),
             "role": role.strip(),
             "q": q.strip(),
         },
